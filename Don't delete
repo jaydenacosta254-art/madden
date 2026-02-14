@@ -1,0 +1,8 @@
+# Create a new vanilla JS Vite project
+npm create vite@latest madden-clone -- --template vanilla
+
+# Navigate into the project folder
+cd madden-clone
+
+# Install dependencies (Three.js)
+npm install three
