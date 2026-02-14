@@ -1,0 +1,741 @@
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+
+// ==========================================
+// 1. GAME DATA & CONFIGURATION
+// ==========================================
+const Y_GROUND = -26; // CRITICAL constraint for stadium alignment
+
+const GAME_STATES = {
+    LOADING: 0, MENU: 1, PLAY_CALL: 2, PRE_SNAP: 3, PLAYING: 4, BALL_IN_AIR: 5, DEAD_BALL: 6, PAUSED: 7
+};
+
+const TEAMS = {
+    AWAY: { name: 'Away Team', color1: '#c60c30', color2: '#ffffff' }, // e.g., Chiefs
+    HOME: { name: 'Home Team', color1: '#002244', color2: '#b0b7bc' }  // e.g., Cowboys
+};
+
+const PLAYBOOK = {
+    "SHOTGUN": [
+        { name: "Four Verticals", type: "pass", routes: [[0, 30], [0, 30], [0, 30], [0, 30], [5, 5]] },
+        { name: "Slants", type: "pass", routes: [[10, 10], [-10, 10], [10, 10], [-10, 10], [5, 2]] },
+        { name: "HB Draw", type: "run", routes: [] }
+    ],
+    "SINGLEBACK": [
+        { name: "Inside Zone", type: "run", routes: [] },
+        { name: "Curl Flats", type: "pass", routes: [[0, 10], [0, 10], [5, 5], [-5, 5], [10, 2]] }
+    ]
+};
+
+// ==========================================
+// 2. GLOBAL VARIABLES
+// ==========================================
+let scene, camera, renderer;
+let currentState = GAME_STATES.LOADING;
+let previousState = GAME_STATES.MENU;
+let keys = {};
+let clock = new THREE.Clock();
+let fieldMesh;
+
+// Game Logic variables
+let score = { away: 0, home: 0 };
+let currentDown = 1;
+let yardsToGo = 10;
+let lineOfScrimmage = -25; // Z axis (-60 to 60)
+let possession = 'AWAY'; // AWAY drives +Z, HOME drives -Z
+let playDirection = 1; // 1 = toward +Z, -1 = toward -Z
+let playClockTimer = 40;
+let lastTime = 0;
+
+let players = [];
+let ball;
+let controlledPlayer = null;
+let currentPlay = null;
+let passTarget = null;
+let passOrigin = null;
+let passTimer = 0;
+let passDuration = 0;
+let passArcHeight = 0;
+
+// ==========================================
+// 3. INITIALIZATION
+// ==========================================
+function init() {
+    // 3D Setup
+    const container = document.getElementById('canvas-container');
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB); // Sky blue
+    scene.fog = new THREE.Fog(0x87CEEB, 80, 200);
+
+    camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+    
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    container.appendChild(renderer.domElement);
+
+    // Lighting
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(50, 100, 50);
+    dirLight.castShadow = true;
+    dirLight.shadow.camera.top = 100;
+    dirLight.shadow.camera.bottom = -100;
+    dirLight.shadow.camera.left = -100;
+    dirLight.shadow.camera.right = 100;
+    dirLight.shadow.mapSize.width = 2048;
+    dirLight.shadow.mapSize.height = 2048;
+    scene.add(dirLight);
+
+    buildField();
+    loadStadium();
+    setupInputs();
+    setupUI();
+
+    window.addEventListener('resize', onWindowResize);
+
+    // Simulate short loading
+    setTimeout(() => {
+        changeState(GAME_STATES.MENU);
+    }, 1000);
+
+    renderer.setAnimationLoop(animate);
+}
+
+// ==========================================
+// 4. ENVIRONMENT GENERATION
+// ==========================================
+function buildField() {
+    // NFL Field: 53.3 yards wide (X), 120 yards long (Z)
+    const fieldWidth = 53.3;
+    const fieldLength = 120;
+    
+    // Canvas Texture for Field Markings
+    const canvas = document.createElement('canvas');
+    canvas.width = 1024;
+    canvas.height = 2048;
+    const ctx = canvas.getContext('2d');
+
+    // Grass base
+    ctx.fillStyle = '#4c9a2a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const pixelsPerYard = canvas.height / 120;
+
+    // Endzones
+    ctx.fillStyle = TEAMS.HOME.color1;
+    ctx.fillRect(0, 0, canvas.width, 10 * pixelsPerYard); // -Z endzone
+    ctx.fillStyle = TEAMS.AWAY.color1;
+    ctx.fillRect(0, canvas.height - 10 * pixelsPerYard, canvas.width, 10 * pixelsPerYard); // +Z endzone
+
+    // Lines & Stripes
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = '#ffffff';
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = "bold 40px Arial";
+
+    for (let i = 0; i <= 100; i++) {
+        let y = (i + 10) * pixelsPerYard; // Offset by 10 yard endzone
+        
+        // Mowed grass effect every 5 yards
+        if (i % 10 < 5 && i < 100) {
+            ctx.fillStyle = 'rgba(0,0,0,0.05)';
+            ctx.fillRect(0, y, canvas.width, 5 * pixelsPerYard);
+        }
+
+        ctx.fillStyle = '#ffffff';
+        // Yard lines
+        if (i % 5 === 0) {
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(canvas.width, y);
+            ctx.stroke();
+
+            // Numbers
+            if (i % 10 === 0 && i !== 0 && i !== 100) {
+                let num = i <= 50 ? i : 100 - i;
+                ctx.save();
+                ctx.translate(canvas.width * 0.15, y);
+                ctx.rotate(-Math.PI/2);
+                ctx.fillText(num.toString(), 0, 0);
+                ctx.restore();
+
+                ctx.save();
+                ctx.translate(canvas.width * 0.85, y);
+                ctx.rotate(Math.PI/2);
+                ctx.fillText(num.toString(), 0, 0);
+                ctx.restore();
+            }
+        }
+    }
+
+    const fieldTexture = new THREE.CanvasTexture(canvas);
+    fieldTexture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+
+    const geometry = new THREE.PlaneGeometry(fieldWidth, fieldLength);
+    const material = new THREE.MeshStandardMaterial({ map: fieldTexture, roughness: 0.8 });
+    fieldMesh = new THREE.Mesh(geometry, material);
+    fieldMesh.rotation.x = -Math.PI / 2;
+    fieldMesh.position.y = Y_GROUND;
+    fieldMesh.receiveShadow = true;
+    scene.add(fieldMesh);
+
+    // Goal posts
+    createGoalPost(-60);
+    createGoalPost(60);
+}
+
+function createGoalPost(zPos) {
+    const postMat = new THREE.MeshStandardMaterial({ color: 0xffd700, metalness: 0.3 });
+    const group = new THREE.Group();
+
+    const base = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 3), postMat);
+    base.position.y = Y_GROUND + 1.5;
+    
+    const crossbar = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.15, 6.2), postMat);
+    crossbar.rotation.z = Math.PI / 2;
+    crossbar.position.y = Y_GROUND + 3;
+    
+    const up1 = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.15, 8), postMat);
+    up1.position.set(-3.1, Y_GROUND + 7, 0);
+    
+    const up2 = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.15, 8), postMat);
+    up2.position.set(3.1, Y_GROUND + 7, 0);
+
+    group.add(base, crossbar, up1, up2);
+    group.position.z = zPos;
+    scene.add(group);
+}
+
+function loadStadium() {
+    const loader = new GLTFLoader();
+    loader.load(
+        'tangier_stadium.glb',
+        (gltf) => {
+            const stadium = gltf.scene;
+            // The prompt strictly requires the field at -26. 
+            // The stadium model should be built around origin, so we just add it.
+            scene.add(stadium);
+            console.log("Stadium loaded successfully.");
+        },
+        undefined,
+        (error) => {
+            console.warn("Could not load tangier_stadium.glb. Game will continue without stadium.", error);
+        }
+    );
+}
+
+// ==========================================
+// 5. GAME ENTITIES (PLAYERS & BALL)
+// ==========================================
+class Player {
+    constructor(team, isOffense, role, x, z) {
+        this.team = team;
+        this.isOffense = isOffense;
+        this.role = role;
+        this.speed = (role === 'WR' || role === 'CB') ? 0.3 : (role === 'DL' || role === 'OL' ? 0.15 : 0.25);
+        this.route = [];
+        this.routeTarget = null;
+        this.routeIndex = 0;
+        
+        // Visuals
+        this.mesh = new THREE.Group();
+        
+        const matBody = new THREE.MeshStandardMaterial({ color: team.color1 });
+        const matHelmet = new THREE.MeshStandardMaterial({ color: team.color2, metalness: 0.5, roughness: 0.2 });
+        
+        // Torso
+        const scale = (role === 'OL' || role === 'DL') ? 1.3 : 1.0;
+        const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.4*scale, 0.4*scale, 1.2), matBody);
+        torso.position.y = 0.6;
+        torso.castShadow = true;
+        
+        // Helmet
+        const helmet = new THREE.Mesh(new THREE.SphereGeometry(0.35*scale), matHelmet);
+        helmet.position.y = 1.4;
+        helmet.castShadow = true;
+
+        // Selection Ring
+        this.selectionRing = new THREE.Mesh(
+            new THREE.RingGeometry(0.6, 0.8, 16),
+            new THREE.MeshBasicMaterial({ color: 0xffd700, side: THREE.DoubleSide, transparent: true, opacity: 0.8 })
+        );
+        this.selectionRing.rotation.x = -Math.PI / 2;
+        this.selectionRing.position.y = 0.05;
+        this.selectionRing.visible = false;
+
+        this.mesh.add(torso, helmet, this.selectionRing);
+        this.mesh.position.set(x, Y_GROUND, z);
+        scene.add(this.mesh);
+    }
+
+    update(dt) {
+        // Basic physics / boundaries
+        if (this.mesh.position.x > 26.65) this.mesh.position.x = 26.65;
+        if (this.mesh.position.x < -26.65) this.mesh.position.x = -26.65;
+        
+        // Route running logic
+        if (currentState === GAME_STATES.PLAYING && this.isOffense && this.route.length > 0 && this !== controlledPlayer) {
+            if (!this.routeTarget) {
+                const rt = this.route[this.routeIndex];
+                this.routeTarget = new THREE.Vector3(
+                    this.mesh.position.x + rt[0], 
+                    Y_GROUND, 
+                    this.mesh.position.z + (rt[1] * playDirection)
+                );
+            }
+
+            const dir = new THREE.Vector3().subVectors(this.routeTarget, this.mesh.position);
+            const dist = dir.length();
+
+            if (dist < 0.5) {
+                this.routeIndex++;
+                if (this.routeIndex < this.route.length) {
+                    const rt = this.route[this.routeIndex];
+                    this.routeTarget = new THREE.Vector3(
+                        this.mesh.position.x + rt[0], 
+                        Y_GROUND, 
+                        this.mesh.position.z + (rt[1] * playDirection)
+                    );
+                } else {
+                    this.routeTarget = null; // Stop at end of route
+                }
+            } else {
+                dir.normalize();
+                this.mesh.position.add(dir.multiplyScalar(this.speed * 60 * dt));
+                this.mesh.lookAt(this.mesh.position.x + dir.x, Y_GROUND, this.mesh.position.z + dir.z);
+            }
+        }
+    }
+}
+
+class Ball {
+    constructor() {
+        this.mesh = new THREE.Mesh(
+            new THREE.SphereGeometry(0.25, 16, 16),
+            new THREE.MeshStandardMaterial({ color: 0x8B4513, roughness: 0.9 })
+        );
+        this.mesh.scale.z = 1.5; // Prolate spheroid
+        this.mesh.castShadow = true;
+        scene.add(this.mesh);
+        this.carrier = null;
+    }
+
+    update() {
+        if (this.carrier) {
+            // Attach to player chest
+            this.mesh.position.copy(this.carrier.mesh.position);
+            this.mesh.position.y += 0.8;
+            this.mesh.position.z += (playDirection * 0.4);
+            this.mesh.rotation.y = this.carrier.mesh.rotation.y;
+            this.mesh.rotation.x = Math.PI/4;
+        }
+    }
+}
+
+// ==========================================
+// 6. GAMEPLAY SYSTEMS
+// ==========================================
+function spawnFormation(formationName) {
+    // Clear old
+    players.forEach(p => scene.remove(p.mesh));
+    players = [];
+    if (!ball) ball = new Ball();
+
+    const offTeam = possession === 'AWAY' ? TEAMS.AWAY : TEAMS.HOME;
+    const defTeam = possession === 'AWAY' ? TEAMS.HOME : TEAMS.AWAY;
+    playDirection = possession === 'AWAY' ? 1 : -1;
+
+    // Line of Scrimmage Setup
+    const los = lineOfScrimmage;
+
+    // Offense (Simplified Singleback)
+    players.push(new Player(offTeam, true, 'OL', 0, los - 0.5 * playDirection));
+    players.push(new Player(offTeam, true, 'OL', -1.5, los - 0.5 * playDirection));
+    players.push(new Player(offTeam, true, 'OL', 1.5, los - 0.5 * playDirection));
+    
+    const qb = new Player(offTeam, true, 'QB', 0, los - 2 * playDirection);
+    players.push(qb);
+    
+    // Receivers mapped to routes
+    const r1 = new Player(offTeam, true, 'WR', -15, los - 0.5 * playDirection);
+    const r2 = new Player(offTeam, true, 'WR', 15, los - 0.5 * playDirection);
+    const r3 = new Player(offTeam, true, 'TE', 3, los - 0.5 * playDirection);
+    const r4 = new Player(offTeam, true, 'WR', -8, los - 1 * playDirection);
+    const r5 = new Player(offTeam, true, 'RB', 0, los - 5 * playDirection);
+    
+    players.push(r1, r2, r3, r4, r5);
+
+    // Defense (Simplified 4-3/Man coverage)
+    players.push(new Player(defTeam, false, 'DL', -1.5, los + 1 * playDirection));
+    players.push(new Player(defTeam, false, 'DL', 1.5, los + 1 * playDirection));
+    players.push(new Player(defTeam, false, 'LB', 0, los + 4 * playDirection));
+    players.push(new Player(defTeam, false, 'CB', -15, los + 3 * playDirection));
+    players.push(new Player(defTeam, false, 'CB', 15, los + 3 * playDirection));
+
+    // Assign ball
+    ball.carrier = qb;
+    setControlledPlayer(qb);
+    
+    // Assign routes if play is passed
+    if (currentPlay && currentPlay.type === 'pass') {
+        const receivers = [r1, r2, r3, r4, r5];
+        for(let i=0; i<receivers.length; i++) {
+            if(currentPlay.routes[i]) receivers[i].route = [currentPlay.routes[i]];
+        }
+    }
+}
+
+function setControlledPlayer(player) {
+    if (controlledPlayer) controlledPlayer.selectionRing.visible = false;
+    controlledPlayer = player;
+    if (controlledPlayer) controlledPlayer.selectionRing.visible = true;
+}
+
+function snapBall() {
+    changeState(GAME_STATES.PLAYING);
+    document.getElementById('receiver-icons').classList.remove('hidden');
+    document.getElementById('controls-hint').innerHTML = "WASD to move, 1-5 to pass, SHIFT to sprint";
+}
+
+function throwPass(receiverIndex) {
+    if (currentState !== GAME_STATES.PLAYING || !currentPlay || currentPlay.type !== 'pass') return;
+    
+    // Find receiver (indexes 4 through 8 in players array based on spawn order)
+    const receiver = players[4 + receiverIndex]; 
+    if (!receiver) return;
+
+    changeState(GAME_STATES.BALL_IN_AIR);
+    document.getElementById('receiver-icons').classList.add('hidden');
+    
+    ball.carrier = null;
+    passOrigin = ball.mesh.position.clone();
+    
+    // Predict receiver position
+    let targetZ = receiver.mesh.position.z + (receiver.routeTarget ? (playDirection * 5) : 0);
+    passTarget = new THREE.Vector3(receiver.mesh.position.x, Y_GROUND + 1.5, targetZ);
+    
+    passTarget.receiver = receiver; // Tag for catch logic
+    passTimer = 0;
+    
+    const dist = passOrigin.distanceTo(passTarget);
+    passDuration = dist / 25; // Speed of throw
+    passArcHeight = dist * 0.15; // Arc
+}
+
+function resolvePass() {
+    const receiver = passTarget.receiver;
+    const dist = ball.mesh.position.distanceTo(receiver.mesh.position);
+    
+    if (dist < 3.0) {
+        // Catch
+        ball.carrier = receiver;
+        setControlledPlayer(receiver);
+        changeState(GAME_STATES.PLAYING);
+        showNotification("CATCH!");
+    } else {
+        // Incomplete
+        ball.mesh.position.y = Y_GROUND + 0.2;
+        showNotification("INCOMPLETE");
+        setTimeout(() => processPlayEnd(0), 2000);
+        changeState(GAME_STATES.DEAD_BALL);
+    }
+}
+
+function processPlayEnd(yardsGainedOverride = null) {
+    let finalZ = ball.mesh.position.z;
+    let yardsGained = yardsGainedOverride !== null ? yardsGainedOverride : Math.round(Math.abs(finalZ - lineOfScrimmage));
+    if (playDirection === 1 && finalZ < lineOfScrimmage) yardsGained = -yardsGained;
+    if (playDirection === -1 && finalZ > lineOfScrimmage) yardsGained = -yardsGained;
+
+    // Check Touchdown
+    if ((playDirection === 1 && finalZ >= 50) || (playDirection === -1 && finalZ <= -50)) {
+        showNotification("TOUCHDOWN!");
+        if (possession === 'AWAY') score.away += 6; else score.home += 6;
+        updateHUD();
+        setTimeout(() => resetDrive(true), 3000);
+        return;
+    }
+
+    lineOfScrimmage += (yardsGained * playDirection);
+    yardsToGo -= yardsGained;
+
+    if (yardsToGo <= 0) {
+        currentDown = 1;
+        yardsToGo = 10;
+        showNotification("FIRST DOWN");
+    } else {
+        currentDown++;
+    }
+
+    if (currentDown > 4) {
+        showNotification("TURNOVER");
+        setTimeout(() => resetDrive(false), 2000);
+    } else {
+        setTimeout(() => changeState(GAME_STATES.PLAY_CALL), 2000);
+    }
+    updateHUD();
+}
+
+function resetDrive(afterScore) {
+    currentDown = 1;
+    yardsToGo = 10;
+    if (afterScore || currentDown > 4) {
+        possession = possession === 'AWAY' ? 'HOME' : 'AWAY';
+        lineOfScrimmage = possession === 'AWAY' ? -30 : 30; // Start at own 20 roughly
+    }
+    changeState(GAME_STATES.PLAY_CALL);
+    updateHUD();
+}
+
+// ==========================================
+// 7. INPUT & UPDATES
+// ==========================================
+function setupInputs() {
+    window.addEventListener('keydown', (e) => {
+        keys[e.code] = true;
+        
+        // Passing mechanics
+        if (currentState === GAME_STATES.PLAYING && ball.carrier && ball.carrier.role === 'QB') {
+            if (e.code === 'Digit1') throwPass(0);
+            if (e.code === 'Digit2') throwPass(1);
+            if (e.code === 'Digit3') throwPass(2);
+            if (e.code === 'Digit4') throwPass(3);
+            if (e.code === 'Digit5') throwPass(4);
+        }
+
+        if (e.code === 'Space' && currentState === GAME_STATES.PRE_SNAP) snapBall();
+        if (e.code === 'Tab' && currentState === GAME_STATES.PRE_SNAP) {
+            e.preventDefault();
+            changeState(GAME_STATES.PLAY_CALL);
+        }
+        if (e.code === 'Escape') {
+            if (currentState === GAME_STATES.PAUSED) changeState(previousState);
+            else { previousState = currentState; changeState(GAME_STATES.PAUSED); }
+        }
+    });
+
+    window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+}
+
+function updateCamera() {
+    if (!ball) return;
+    
+    // Broadcast camera style
+    const targetX = ball.mesh.position.x * 0.3;
+    const targetZ = ball.mesh.position.z - (40 * playDirection);
+    const targetY = Y_GROUND + 30;
+
+    camera.position.lerp(new THREE.Vector3(targetX, targetY, targetZ), 0.1);
+    
+    const lookTarget = ball.mesh.position.clone();
+    lookTarget.z += (10 * playDirection); // Look slightly ahead
+    camera.lookAt(lookTarget);
+}
+
+function updateAI(dt) {
+    if (currentState !== GAME_STATES.PLAYING && currentState !== GAME_STATES.BALL_IN_AIR) return;
+
+    players.forEach(p => {
+        if (p.isOffense || p === controlledPlayer) return;
+
+        // Defense chases ball
+        const target = ball.carrier ? ball.carrier.mesh.position : ball.mesh.position;
+        const dir = new THREE.Vector3().subVectors(target, p.mesh.position);
+        const dist = dir.length();
+
+        if (dist < 1.5 && ball.carrier && currentState === GAME_STATES.PLAYING) {
+            // Tackle!
+            changeState(GAME_STATES.DEAD_BALL);
+            showNotification("TACKLED");
+            setTimeout(() => processPlayEnd(), 2000);
+        } else {
+            dir.normalize();
+            p.mesh.position.add(dir.multiplyScalar(p.speed * 60 * dt));
+            p.mesh.lookAt(target.x, Y_GROUND, target.z);
+        }
+    });
+}
+
+function updatePlayerMovement(dt) {
+    if (!controlledPlayer || currentState !== GAME_STATES.PLAYING) return;
+
+    let moveZ = 0;
+    let moveX = 0;
+    
+    if (keys['KeyW']) moveZ = 1 * playDirection;
+    if (keys['KeyS']) moveZ = -1 * playDirection;
+    if (keys['KeyA']) moveX = 1 * playDirection;
+    if (keys['KeyD']) moveX = -1 * playDirection;
+
+    if (moveX !== 0 || moveZ !== 0) {
+        const speedMultiplier = keys['ShiftLeft'] ? 1.5 : 1.0;
+        const moveVector = new THREE.Vector3(moveX, 0, moveZ).normalize();
+        
+        controlledPlayer.mesh.position.add(moveVector.multiplyScalar(controlledPlayer.speed * speedMultiplier * 60 * dt));
+        
+        // Face direction of movement
+        controlledPlayer.mesh.lookAt(
+            controlledPlayer.mesh.position.x + moveX, 
+            Y_GROUND, 
+            controlledPlayer.mesh.position.z + moveZ
+        );
+    }
+}
+
+function animate() {
+    const dt = clock.getDelta();
+    const time = clock.getElapsedTime();
+
+    // Play Clock
+    if ((currentState === GAME_STATES.PRE_SNAP || currentState === GAME_STATES.PLAYING) && time - lastTime > 1) {
+        lastTime = time;
+        if (currentState === GAME_STATES.PRE_SNAP) {
+            playClockTimer--;
+            updateHUD();
+            if(playClockTimer <= 0) {
+                showNotification("DELAY OF GAME");
+                lineOfScrimmage -= (5 * playDirection);
+                changeState(GAME_STATES.DEAD_BALL);
+                setTimeout(() => changeState(GAME_STATES.PLAY_CALL), 2000);
+            }
+        }
+    }
+
+    if (currentState === GAME_STATES.PLAYING || currentState === GAME_STATES.PRE_SNAP || currentState === GAME_STATES.BALL_IN_AIR) {
+        players.forEach(p => p.update(dt));
+        updatePlayerMovement(dt);
+        updateAI(dt);
+        if (ball) ball.update();
+        updateCamera();
+    }
+
+    // Pass Physics Parabola
+    if (currentState === GAME_STATES.BALL_IN_AIR) {
+        passTimer += dt;
+        let t = passTimer / passDuration;
+        if (t >= 1) { t = 1; resolvePass(); }
+        
+        ball.mesh.position.lerpVectors(passOrigin, passTarget, t);
+        ball.mesh.position.y += Math.sin(t * Math.PI) * passArcHeight;
+        ball.mesh.rotation.x += 0.2; // Spiral
+    }
+
+    renderer.render(scene, camera);
+}
+
+// ==========================================
+// 8. UI AND STATE MANAGEMENT
+// ==========================================
+function changeState(newState) {
+    currentState = newState;
+    
+    // Hide all overlays initially
+    document.querySelectorAll('.screen').forEach(el => el.classList.add('hidden'));
+    document.getElementById('hud').classList.remove('hidden');
+
+    switch (newState) {
+        case GAME_STATES.LOADING:
+            document.getElementById('hud').classList.add('hidden');
+            document.getElementById('loading-screen').classList.remove('hidden');
+            break;
+        case GAME_STATES.MENU:
+            document.getElementById('hud').classList.add('hidden');
+            document.getElementById('main-menu').classList.remove('hidden');
+            break;
+        case GAME_STATES.PLAY_CALL:
+            document.getElementById('play-call-menu').classList.remove('hidden');
+            document.getElementById('receiver-icons').classList.add('hidden');
+            buildPlayMenu();
+            break;
+        case GAME_STATES.PRE_SNAP:
+            playClockTimer = 40;
+            updateHUD();
+            document.getElementById('controls-hint').innerHTML = "SPACE to snap | TAB for playbook";
+            spawnFormation("SHOTGUN");
+            break;
+        case GAME_STATES.PAUSED:
+            document.getElementById('pause-menu').classList.remove('hidden');
+            break;
+    }
+}
+
+function setupUI() {
+    document.getElementById('btn-quick-play').addEventListener('click', () => changeState(GAME_STATES.PLAY_CALL));
+    document.getElementById('btn-resume').addEventListener('click', () => changeState(previousState));
+    document.getElementById('btn-quit').addEventListener('click', () => { location.reload(); });
+}
+
+function buildPlayMenu() {
+    const tabsContainer = document.getElementById('formation-tabs');
+    const gridContainer = document.getElementById('play-grid');
+    tabsContainer.innerHTML = '';
+    gridContainer.innerHTML = '';
+
+    let first = true;
+    for (const [formation, plays] of Object.entries(PLAYBOOK)) {
+        const tab = document.createElement('button');
+        tab.className = `tab ${first ? 'active' : ''}`;
+        tab.innerText = formation;
+        
+        tab.onclick = () => {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            renderPlays(plays);
+        };
+        tabsContainer.appendChild(tab);
+        
+        if (first) { renderPlays(plays); first = false; }
+    }
+
+    function renderPlays(plays) {
+        gridContainer.innerHTML = '';
+        plays.forEach(play => {
+            const card = document.createElement('div');
+            card.className = 'play-card';
+            card.innerHTML = `<div class="play-name">${play.name}</div><div class="play-type">${play.type.toUpperCase()}</div>`;
+            card.onclick = () => {
+                currentPlay = play;
+                changeState(GAME_STATES.PRE_SNAP);
+            };
+            gridContainer.appendChild(card);
+        });
+    }
+}
+
+function updateHUD() {
+    document.getElementById('score-away').innerText = score.away;
+    document.getElementById('score-home').innerText = score.home;
+    
+    const pc = document.getElementById('play-clock');
+    pc.innerText = playClockTimer;
+    if(playClockTimer <= 10) pc.classList.add('warning');
+    else pc.classList.remove('warning');
+
+    let yardLine = Math.abs(Math.round(lineOfScrimmage));
+    let side = lineOfScrimmage < 0 ? 'OWN' : 'OPP';
+    if (yardLine > 50) yardLine = 100 - yardLine;
+
+    document.getElementById('down-distance').innerText = 
+        `${currentDown}${['ST','ND','RD','TH'][currentDown-1] || 'TH'} & ${yardsToGo} | ${side} ${yardLine}`;
+}
+
+function showNotification(text) {
+    const noti = document.getElementById('notification');
+    noti.innerText = text;
+    noti.style.opacity = 1;
+    setTimeout(() => { noti.style.opacity = 0; }, 2000);
+}
+
+function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+init();
